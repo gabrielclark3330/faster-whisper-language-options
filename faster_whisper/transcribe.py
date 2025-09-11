@@ -57,6 +57,9 @@ class Segment:
     no_speech_prob: float
     words: Optional[List[Word]]
     temperature: Optional[float]
+    language: Optional[str] = None
+    language_probability: Optional[float] = None
+    all_language_probs: Optional[List[Tuple[str, float]]] = None
 
     def _asdict(self):
         warn(
@@ -117,15 +120,15 @@ class BatchedInferencePipeline:
         self.last_speech_timestamp = 0.0
 
     def forward(self, features, tokenizer, chunks_metadata, options):
-        encoder_output, outputs = self.generate_segment_batched(
+        encoder_output, outputs, langs_for_batch = self.generate_segment_batched(
             features, tokenizer, options
         )
 
         segmented_outputs = []
         segment_sizes = []
-        for chunk_metadata, output in zip(chunks_metadata, outputs):
+        for batch_idx, (chunk_metadata, output) in enumerate(zip(chunks_metadata, outputs)):
             duration = chunk_metadata["duration"]
-            segment_size = int(ceil(duration) * self.model.frames_per_second)
+            segment_size = int(round(duration * self.model.frames_per_second))
             segment_sizes.append(segment_size)
             (
                 subsegments,
@@ -139,35 +142,42 @@ class BatchedInferencePipeline:
                 segment_duration=duration,
                 seek=0,
             )
-            segmented_outputs.append(
-                [
-                    dict(
-                        text=tokenizer.decode(subsegment["tokens"]),
-                        avg_logprob=output["avg_logprob"],
-                        no_speech_prob=output["no_speech_prob"],
-                        tokens=subsegment["tokens"],
-                        start=subsegment["start"],
-                        end=subsegment["end"],
-                        compression_ratio=get_compression_ratio(
-                            tokenizer.decode(subsegment["tokens"])
-                        ),
-                        seek=int(
-                            chunk_metadata["offset"] * self.model.frames_per_second
-                        ),
-                    )
-                    for subsegment in subsegments
-                ]
-            )
+            segment = []
+            lang_info = None
+            if options.multilingual and langs_for_batch is not None:
+                lang_info = langs_for_batch[batch_idx]
+            for subsegment in subsegments:
+                sub_dict = dict(
+                    text=tokenizer.decode(subsegment["tokens"]),
+                    avg_logprob=output["avg_logprob"],
+                    no_speech_prob=output["no_speech_prob"],
+                    tokens=subsegment["tokens"],
+                    start=subsegment["start"],
+                    end=subsegment["end"],
+                    compression_ratio=get_compression_ratio(
+                        tokenizer.decode(subsegment["tokens"])
+                    ),
+                    seek=int(chunk_metadata["offset"] * self.model.frames_per_second),
+                )
+                if lang_info is not None:
+                    sub_dict["language"] = lang_info["language"]
+                    sub_dict["language_probability"] = lang_info["language_probability"]
+                    sub_dict["all_language_probs"] = lang_info["all_language_probs"]
+                segment.append(sub_dict)
+            segmented_outputs.append(segment)
+
         if options.word_timestamps:
-            self.last_speech_timestamp = self.model.add_word_timestamps(
-                segmented_outputs,
-                tokenizer,
-                encoder_output,
-                segment_sizes,
-                options.prepend_punctuations,
-                options.append_punctuations,
-                self.last_speech_timestamp,
-            )
+            for j, (segment, num_frames) in enumerate(zip(segmented_outputs, segment_sizes)):
+                enc_out_j = self.model.encode(features[j])
+                self.last_speech_timestamp = self.model.add_word_timestamps(
+                    [segment],
+                    tokenizer,
+                    enc_out_j,
+                    num_frames,
+                    options.prepend_punctuations,
+                    options.append_punctuations,
+                    self.last_speech_timestamp,
+                )
 
         return segmented_outputs
 
@@ -209,15 +219,22 @@ class BatchedInferencePipeline:
         encoder_output = self.model.encode(features)
         prompts = [prompt.copy() for _ in range(batch_size)]
 
+        langs_for_batch = None
         if options.multilingual:
-            language_tokens = [
-                tokenizer.tokenizer.token_to_id(segment_langs[0][0])
-                for segment_langs in self.model.model.detect_language(encoder_output)
-            ]
+            langs_for_batch = []
+            for segment_langs in self.model.model.detect_language(encoder_output):
+                top_tok, top_prob = segment_langs[0]
+                langs_for_batch.append(
+                    {
+                        "language": top_tok[2:-2],
+                        "language_probability": top_prob,
+                        "all_language_probs": [(tok[2:-2], p) for (tok, p) in segment_langs],
+                        "language_token_id": tokenizer.tokenizer.token_to_id(top_tok),
+                    }
+                )
             language_token_index = prompt.index(tokenizer.language)
-
-            for i, language_token in enumerate(language_tokens):
-                prompts[i][language_token_index] = language_token
+            for i, lang_info in enumerate(langs_for_batch):
+                prompts[i][language_token_index] = lang_info["language_token_id"]
 
         results = self.model.model.generate(
             encoder_output,
@@ -248,8 +265,7 @@ class BatchedInferencePipeline:
                     tokens=result.sequences_ids[0],
                 )
             )
-
-        return encoder_output, output
+        return encoder_output, output, langs_for_batch
 
     def transcribe(
         self,
@@ -595,6 +611,9 @@ class BatchedInferencePipeline:
                         no_speech_prob=segment["no_speech_prob"],
                         compression_ratio=segment["compression_ratio"],
                         temperature=options.temperatures[0],
+                        language=segment.get("language"),
+                        language_probability=segment.get("language_probability"),
+                        all_language_probs=segment.get("all_language_probs"),
                     )
 
                 pbar.update(1)
@@ -1179,9 +1198,12 @@ class WhisperModel:
                 results = self.model.detect_language(encoder_output)
                 language_token, language_probability = results[0][0]
                 language = language_token[2:-2]
+                per_window_probs = [(tok[2:-2], prob) for (tok, prob) in results[0]]
 
                 tokenizer.language = tokenizer.tokenizer.token_to_id(language_token)
                 tokenizer.language_code = language
+            else:
+                language, top_prob, per_window_probs = None, None, None
 
             prompt = self.get_prompt(
                 tokenizer,
@@ -1353,6 +1375,9 @@ class WhisperModel:
                         if options.word_timestamps
                         else None
                     ),
+                    language=language,
+                    language_probability=language_probability,
+                    all_language_probs=per_window_probs,
                 )
 
             if (
