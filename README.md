@@ -1,4 +1,7 @@
-[![CI](https://github.com/SYSTRAN/faster-whisper/workflows/CI/badge.svg)](https://github.com/SYSTRAN/faster-whisper/actions?query=workflow%3ACI) [![PyPI version](https://badge.fury.io/py/faster-whisper.svg)](https://badge.fury.io/py/faster-whisper)
+# Please read these notes before using this fork
+1. When using batched inference with precomputed segments the default behavior is broken in faster whisper. It is fixed in this branch but I have not bothered to validate that both VAD and precomputed VAD are working here. In this implementation please always specify `clip_timestamps`.
+2. I adjusted the language detection path to return language codes per segment. When setting `multilingual=True` These can be accessed like `[(segment.language, segment.language_probability) for segment in segments]`
+3. All other settings should work as expected as long as you take 1 into consideration!
 
 # Faster Whisper transcription with CTranslate2
 

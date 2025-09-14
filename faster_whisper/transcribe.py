@@ -575,7 +575,6 @@ class BatchedInferencePipeline:
             options,
             log_progress,
         )
-        segments = restore_speech_timestamps(segments, clip_timestamps, sampling_rate)
 
         return segments, info
 
